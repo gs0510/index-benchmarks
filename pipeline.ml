@@ -12,13 +12,27 @@ let read_fpath p = Bos.OS.File.read p |> Rresult.R.error_msg_to_invalid_arg
 let read_channel_uri p =
   read_fpath p |> String.trim |> Uri.of_string |> Current_slack.channel
 
+let pool = Current.Pool.create ~label:"docker" 1
+
+let get_commit ~head =
+  let { Github.Repo_id.owner; name } = Github.Api.Commit.repo_id head in
+  let hash = Github.Api.Commit.hash head in
+  hash ^ owner ^ name
+
+let merge_json bench head =
+  let+ head = head in
+  let commit_string = get_commit ~head in
+  Yojson.Basic.to_string
+    (`Assoc
+      [ ("commit", `String commit_string); ("benchmarks", `String bench) ])
+
 (* Generate a Dockerfile for building all the opam packages in the build context. *)
 let dockerfile ~base =
   let open Dockerfile in
   from (Docker.Image.hash base)
   @@ run
        "sudo apt-get install -qq -yy libffi-dev liblmdb-dev m4 pkg-config \
-        gnuplot-x11"
+        gnuplot-x11 capnproto libcapnp-dev libgmp-dev libsqlite3-dev"
   @@ copy ~src:[ "--chown=opam:opam ." ] ~dst:"index" ()
   @@ workdir "index"
   @@ run "opam install -y --deps-only -t ."
@@ -30,20 +44,17 @@ let dockerfile ~base =
 
 let weekly = Current_cache.Schedule.v ~valid_for:(Duration.of_day 7) ()
 
-let pipeline ~github ~repo ?output_file ?slack_path ?docker_cpu
-    ?docker_numa_node ~docker_shm_size () =
+let pipeline ~app ?output_file ?slack_path ?docker_cpu ?docker_numa_node
+    ~docker_shm_size () =
   let tmp_source =
     Bos.OS.File.tmp "index-bench-result-%s.txt"
     |> Rresult.R.error_msg_to_invalid_arg
   in
   let tmp_target = Fpath.(v "/tmp" / filename tmp_source) in
-  let head = Github.Api.head_commit github repo in
-  let src = Git.fetch (Current.map Github.Api.Commit.id head) in
   let dockerfile =
     let+ base = Docker.pull ~schedule:weekly "ocaml/opam2" in
     dockerfile ~base
   in
-  let image = Docker.build ~pull:false ~dockerfile (`Git src) in
   let docker_cpuset_cpus =
     match docker_cpu with
     | Some i -> [ "--cpuset-cpus"; string_of_int i ]
@@ -68,64 +79,76 @@ let pipeline ~github ~repo ?output_file ?slack_path ?docker_cpu
           Fmt.str "/dev/shm:rw,noexec,nosuid,size=%dG" docker_shm_size;
         ]
   in
-  let s =
-    let run_args =
-      [
-        "--security-opt";
-        "seccomp=./aslr_seccomp.json";
-        "--mount";
-        Fmt.str "type=bind,source=%a,target=%a" Fpath.pp tmp_source Fpath.pp
-          tmp_target;
-      ]
-      @ tmpfs
-      @ docker_cpuset_cpus
-      @ docker_cpuset_mems
-    in
-    let+ () =
-      Docker.run ~run_args image
-        ~args:
-          [
-            "/usr/bin/setarch";
-            "x86_64";
-            "--addr-no-randomize";
-            "_build/default/bench/db_bench.exe";
-            "-d";
-            "/dev/shm";
-            "--bench";
-            "index";
-            "--json";
-            Fmt.str "%a" Fpath.pp tmp_target;
-          ]
-    in
-    (* Conditionally move the results to ?output_file *)
-    let results_path =
-      match output_file with
-      | Some path ->
-          Bos.OS.Path.move tmp_source path |> Rresult.R.error_msg_to_invalid_arg;
-          path
-      | None -> tmp_source
-    in
-    (* No need to read JSON if we're not publishing the results anywhere *)
-    match slack_path with
-    | Some p -> Some (p, read_fpath results_path)
-    | None -> None
-  in
-  s
-  |> Current.option_map (fun p ->
-         Current.component "post"
-         |> let** path, _ = p in
-            let channel = read_channel_uri path in
-            Slack.post channel ~key:"output" (Current.map snd p))
-  |> Current.ignore_value
+  Github.App.installations app
+  |> Current.list_iter ~pp:Github.Installation.pp @@ fun installation ->
+     let repos = Github.Installation.repositories installation in
+     repos
+     |> Current.list_iter ~pp:Github.Api.Repo.pp @@ fun repo ->
+        Github.Api.Repo.ci_refs repo
+        |> Current.list_iter ~pp:Github.Api.Commit.pp @@ fun head ->
+           let src = Git.fetch (Current.map Github.Api.Commit.id head) in
+           let image = Docker.build ~pool ~pull:false ~dockerfile (`Git src) in
+           let s =
+             let run_args =
+               [
+                 "--security-opt";
+                 "seccomp=./aslr_seccomp.json";
+                 "--mount";
+                 Fmt.str "type=bind,source=%a,target=%a" Fpath.pp tmp_source
+                   Fpath.pp tmp_target;
+               ]
+               @ tmpfs
+               @ docker_cpuset_cpus
+               @ docker_cpuset_mems
+             in
+             let results_path =
+               match output_file with
+               | Some path ->
+                   Bos.OS.Path.move tmp_source path
+                   |> Rresult.R.error_msg_to_invalid_arg;
+                   path
+               | None -> tmp_source
+             in
+             let+ () =
+               Docker.run ~run_args image
+                 ~args:
+                   [
+                     "/usr/bin/setarch";
+                     "x86_64";
+                     "--addr-no-randomize";
+                     "_build/default/bench/db_bench.exe";
+                     "-d";
+                     "/dev/shm";
+                     "--bench";
+                     "index";
+                     "--json";
+                     Fmt.str "%a" Fpath.pp tmp_target;
+                   ]
+             and+ s =
+               match slack_path with
+               | Some p ->
+                   let+ json = merge_json (read_fpath results_path) head in
+                   Some (p, json)
+               | None -> Current.return None
+             in
+             s
+           in
+           s
+           |> Current.option_map (fun p ->
+                  Current.component "post"
+                  |> let** path, _ = p in
+                     let channel = read_channel_uri path in
+                     Slack.post channel ~key:"output" (Current.map snd p))
+           |> Current.ignore_value
 
 let webhooks = [ ("github", Github.input_webhook) ]
 
-let main config mode github repo output_file slack_path docker_cpu
-    docker_numa_node docker_shm_size () =
+let main config mode app output_file slack_path docker_cpu docker_numa_node
+    docker_shm_size () =
   let engine =
     Current.Engine.create ~config
-      (pipeline ~github ~repo ?output_file ?slack_path ?docker_cpu
-         ?docker_numa_node ~docker_shm_size)
+      (pipeline ~app ?output_file ?slack_path ?docker_cpu ?docker_numa_node
+         ~docker_shm_size)
   in
   Logging.run
     (Lwt.choose
@@ -162,12 +185,6 @@ let docker_shm_size =
   let doc = "Size of tmpfs volume to be mounted in /dev/shm (in GB)." in
   Arg.(value & opt int 4 & info [ "docker-shm-size" ] ~doc)
 
-let repo =
-  Arg.required
-  @@ Arg.pos 0 (Arg.some Github.Repo_id.cmdliner) None
-  @@ Arg.info ~doc:"The GitHub repository (owner/name) to monitor." ~docv:"REPO"
-       []
-
 let setup_log =
   let init style_renderer level = Logging.init ?style_renderer ?level () in
   Term.(const init $ Fmt_cli.style_renderer () $ Logs_cli.level ())
@@ -178,8 +195,7 @@ let cmd =
       const main
       $ Current.Config.cmdliner
       $ Current_web.cmdliner
-      $ Current_github.Api.cmdliner
-      $ repo
+      $ Github.App.cmdliner
       $ output_file
       $ slack_path
       $ docker_cpu
