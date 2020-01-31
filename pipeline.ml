@@ -30,18 +30,58 @@ let dockerfile ~base =
 
 let weekly = Current_cache.Schedule.v ~valid_for:(Duration.of_day 7) ()
 
-let tmp_host =
-  Bos.OS.File.tmp ~mode:0o666
-    ~dir:Fpath.(v "/data/tmp/")
-    "index-bench-result-%s.txt"
-  |> Rresult.R.error_msg_to_invalid_arg
+let merge_json metadata json =
+  Yojson.Basic.to_string
+    (`Assoc [ ("metadata", `String metadata); ("result", `String json) ])
+
+let num_file_dir path =
+  let dir_handle = Unix.opendir path in
+  let rec loop acc =
+    try
+      let _ = Unix.readdir dir_handle in
+      loop (acc + 1)
+    with End_of_file -> acc
+  in
+  let num = loop 0 in
+  let () = Unix.closedir dir_handle in
+  num
+
+let create_tmp_host repo commit_hash =
+  let path = "/data/tmp/" ^ repo in
+  let () =
+    if not (Sys.file_exists path) then try Unix.mkdir path 0o777 with _ -> ()
+  in
+  let path = path ^ "/" ^ commit_hash in
+  let () =
+    if not (Sys.file_exists path) then try Unix.mkdir path 0o777 with _ -> ()
+  in
+  let files = num_file_dir path in
+  let file_name = string_of_int files in
+  let path = path ^ "/" ^ file_name ^ ".json" in
+  let oc = open_out path in
+  let () = Unix.chmod path 0o666 in
+  let () = close_out oc in
+  Fpath.(v path)
+
+let get_commit github repo =
+  let head = Github.Api.head_commit github repo in
+  let+ commit = head in
+  let repo_name = repo.name in
+  let tmp_host = create_tmp_host repo_name (Github.Api.Commit.hash commit) in
+  tmp_host
 
 let pipeline ~github ~repo ?output_file ?slack_path ?docker_cpu
     ?docker_numa_node ~docker_shm_size () =
-  let tmp_container = Fpath.(v "/data/tmp" / filename tmp_host) in
   let head = Github.Api.head_commit github repo in
+  let repo_name = repo.name in
+  let commit = get_commit github repo in
+  let tmp_host = create_tmp_host repo_name (Github.Api.Commit.hash commit) in
+  let tmp_container = Fpath.(v "/data/tmp/" / filename tmp_host) in
+  let () =
+    let oc = open_out (Fpath.filename tmp_host) in
+    close_out oc
+  in
   let src = Git.fetch (Current.map Github.Api.Commit.id head) in
-  let () = Unix.chmod ("/data/tmp/" ^ Fpath.filename tmp_host) 0o666 in
   let dockerfile =
     let+ base = Docker.pull ~schedule:weekly "ocaml/opam2" in
     dockerfile ~base
@@ -109,7 +149,12 @@ let pipeline ~github ~repo ?output_file ?slack_path ?docker_cpu
     in
     (* No need to read JSON if we're not publishing the results anywhere *)
     match slack_path with
-    | Some p -> Some (p, read_fpath results_path)
+    | Some p ->
+        Some
+          ( p,
+            merge_json
+              (repo_name ^ Github.Api.Commit.hash commit)
+              (read_fpath results_path) )
     | None -> None
   in
   s
