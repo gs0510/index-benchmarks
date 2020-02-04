@@ -58,6 +58,7 @@ let create_tmp_host repo commit_hash =
   let files = num_file_dir path in
   let file_name = string_of_int files in
   let path = path ^ "/" ^ file_name ^ ".json" in
+  let () = Printf.printf "%s PATH\n" path in
   let oc = open_out path in
   let () = Unix.chmod path 0o666 in
   let () = close_out oc in
@@ -66,17 +67,17 @@ let create_tmp_host repo commit_hash =
 let get_commit github repo =
   let head = Github.Api.head_commit github repo in
   let+ commit = head in
-  let repo_name = repo.name in
-  let tmp_host = create_tmp_host repo_name (Github.Api.Commit.hash commit) in
-  tmp_host
+  Github.Api.Commit.hash commit
 
 let pipeline ~github ~repo ?output_file ?slack_path ?docker_cpu
     ?docker_numa_node ~docker_shm_size () =
   let head = Github.Api.head_commit github repo in
   let repo_name = repo.name in
-  let commit = get_commit github repo in
-  let tmp_host = create_tmp_host repo_name (Github.Api.Commit.hash commit) in
-  let tmp_container = Fpath.(v "/data/tmp/" / filename tmp_host) in
+  let* commit = get_commit github repo in
+  let tmp_host = create_tmp_host repo_name commit in
+  let tmp_container =
+    Fpath.(v ("/data/tmp/" ^ repo_name ^ "/" ^ commit) / filename tmp_host)
+  in
   let () =
     let oc = open_out (Fpath.filename tmp_host) in
     close_out oc
@@ -150,11 +151,7 @@ let pipeline ~github ~repo ?output_file ?slack_path ?docker_cpu
     (* No need to read JSON if we're not publishing the results anywhere *)
     match slack_path with
     | Some p ->
-        Some
-          ( p,
-            merge_json
-              (repo_name ^ Github.Api.Commit.hash commit)
-              (read_fpath results_path) )
+        Some (p, merge_json (repo_name ^ commit) (read_fpath results_path))
     | None -> None
   in
   s
