@@ -29,14 +29,11 @@ let dockerfile ~base =
 let weekly = Current_cache.Schedule.v ~valid_for:(Duration.of_day 7) ()
 
 let pipeline ~github ~repo ?slack_path ?docker_cpu ?docker_numa_node
-    ~docker_shm_size ~commit ~conninfo () =
-  let head = Github.Api.head_commit github repo in
-  let src = Git.fetch (Current.map Github.Api.Commit.id head) in
+    ~docker_shm_size ~conninfo () =
   let dockerfile =
     let+ base = Docker.pull ~schedule:weekly "ocaml/opam2" in
     `Contents (dockerfile ~base)
   in
-  let image = Docker.build ~pool ~pull:false ~dockerfile (`Git src) in
   let docker_cpuset_cpus =
     match docker_cpu with
     | Some i -> [ "--cpuset-cpus"; string_of_int i ]
@@ -61,53 +58,62 @@ let pipeline ~github ~repo ?slack_path ?docker_cpu ?docker_numa_node
           Fmt.str "/dev/shm:rw,noexec,nosuid,size=%dG" docker_shm_size;
         ]
   in
-  let s =
-    let run_args =
-      [ "--security-opt"; "seccomp=./aslr_seccomp.json" ]
-      @ tmpfs
-      @ docker_cpuset_cpus
-      @ docker_cpuset_mems
-    in
-    let+ output =
-      Docker.pread ~run_args image
-        ~args:
-          [
-            "/usr/bin/setarch";
-            "x86_64";
-            "--addr-no-randomize";
-            "_build/default/bench/bench.exe";
-            "-d";
-            "/dev/shm";
-            "--json";
-          ]
-    in
-    let content =
-      Utils.merge_json repo.name commit (Yojson.Basic.from_string output)
-    in
-    let () = Utils.populate_postgres conninfo commit content in
-    match slack_path with Some p -> Some (p, content) | None -> None
-  in
-  s
-  |> Current.option_map (fun p ->
-         Current.component "post"
-         |> let** path, _ = p in
-            let channel = read_channel_uri path in
-            Slack.post channel ~key:"output" (Current.map snd p))
-  |> Current.ignore_value
+  let repos = Current.return (github, repo) in
+  let open_prs = Github.Api.Repo.ci_refs repos in
+  Current.list_iter
+    (module Github.Api.Commit)
+    (fun head ->
+      let src = Git.fetch (Current.map Github.Api.Commit.id head) in
+      let image = Docker.build ~pool ~pull:false ~dockerfile (`Git src) in
+      let s =
+        let run_args =
+          [ "--security-opt"; "seccomp=./aslr_seccomp.json" ]
+          @ tmpfs
+          @ docker_cpuset_cpus
+          @ docker_cpuset_mems
+        in
+        let+ output =
+          Docker.pread ~run_args image
+            ~args:
+              [
+                "/usr/bin/setarch";
+                "x86_64";
+                "--addr-no-randomize";
+                "_build/default/bench/bench.exe";
+                "--nb-entries";
+                "1000";
+                "-d";
+                "/dev/shm";
+                "--json";
+              ]
+        and+ head = head in
+        let commit = Github.Api.Commit.hash head in
+        let content =
+          Utils.merge_json repo.name commit (Yojson.Basic.from_string output)
+        in
+        let () = Utils.populate_postgres conninfo commit content in
+        match slack_path with Some p -> Some (p, content) | None -> None
+      in
+      s
+      |> Current.option_map (fun p ->
+             Current.component "post"
+             |> let** path, _ = p in
+                let channel = read_channel_uri path in
+                Slack.post channel ~key:"output" (Current.map snd p))
+      |> Current.ignore_value)
+    open_prs
 
 let webhooks = [ ("github", Github.webhook) ]
 
 type token = { token_file : string; token_api_file : Github.Api.t }
 
 let main config mode github_token (repo : Current_github.Repo_id.t) slack_path
-    docker_cpu docker_numa_node docker_shm_size conninfo user () =
-  let token = Utils.read_file github_token.token_file in
-  let commit = Utils.get_commit repo.name repo.owner user token in
+    docker_cpu docker_numa_node docker_shm_size conninfo () =
   let github = github_token.token_api_file in
   let engine =
     Current.Engine.create ~config
       (pipeline ~github ~repo ?slack_path ?docker_cpu ?docker_numa_node
-         ~docker_shm_size ~commit ~conninfo)
+         ~docker_shm_size ~conninfo)
   in
   let routes =
     Routes.((s "webhooks" / s "github" /? nil) @--> Github.webhook)
@@ -152,12 +158,6 @@ let repo =
   @@ Arg.info ~doc:"The GitHub repository (owner/name) to monitor." ~docv:"REPO"
        []
 
-let user =
-  Arg.required
-  @@ Arg.opt Arg.(some string) None
-  @@ Arg.info ~doc:"User for which the OAuth token is given." ~docv:"USER"
-       [ "oauth-user" ]
-
 let setup_log =
   let init style_renderer level = Logging.init ?style_renderer ?level () in
   Term.(const init $ Fmt_cli.style_renderer () $ Logs_cli.level ())
@@ -196,7 +196,6 @@ let cmd =
       $ docker_numa_node
       $ docker_shm_size
       $ conninfo
-      $ user
       $ setup_log),
     Term.info "github" ~doc )
 
