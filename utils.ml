@@ -39,7 +39,8 @@ let read_file path =
 
 open Yojson.Basic.Util
 
-let format_benchmark_data commit name time mbs_per_sec ops_per_sec timestamp =
+let format_benchmark_data commit name time mbs_per_sec ops_per_sec timestamp pr
+    =
   "('"
   ^ commit
   ^ "', '"
@@ -52,11 +53,13 @@ let format_benchmark_data commit name time mbs_per_sec ops_per_sec timestamp =
   ^ ops_per_sec
   ^ ","
   ^ timestamp
+  ^ ","
+  ^ pr
   ^ ") "
 
 let get_repo json = Yojson.Basic.from_string json |> member "repo" |> to_string
 
-let get_data_from_json commit json =
+let get_data_from_json commit json pr =
   let bench_objects =
     Yojson.Basic.from_string json
     |> member "result"
@@ -74,32 +77,37 @@ let get_data_from_json commit json =
            (metrics |> member "time" |> to_float |> string_of_float)
            (metrics |> member "mbs_per_sec" |> to_float |> string_of_float)
            (metrics |> member "ops_per_sec" |> to_float |> string_of_float))
-          (string_of_float (Unix.time ())))
+          (string_of_float (Unix.time ()))
+          pr)
       bench_objects bench_names
   in
   String.concat "," result_string
 
 open! Postgresql
 
-let populate_postgres conninfo commit json_string =
+let populate_postgres conninfo commit json_string num =
   try
     let repository = get_repo json_string in
     let c = new connection ~conninfo () in
+    let pr = Printf.sprintf "%s/%d" repository num in
     let _ =
       c#exec ~expect:[ Command_ok ]
-        ( "insert into benchmarks(repositories, commits, json_data) values ( '"
+        ( "insert into benchmarks(repositories, commits, json_data, branch) \
+           values ( '"
         ^ repository
         ^ "', '"
         ^ commit
         ^ "', '"
         ^ json_string
+        ^ "', '"
+        ^ pr
         ^ "' )" )
     in
-    let data_to_insert = get_data_from_json commit json_string in
+    let data_to_insert = get_data_from_json commit json_string pr in
     let _ =
       c#exec ~expect:[ Command_ok ]
         ( "insert into benchmarksrun(commits, name, time, mbs_per_sec, \
-           ops_per_sec, timestamp) values "
+           ops_per_sec, timestamp, branch) values "
         ^ data_to_insert )
     in
     c#finish
